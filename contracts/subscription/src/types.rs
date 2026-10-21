@@ -54,4 +54,7 @@ pub struct Subscription {
     /// Plan this subscription was created from, or 0 for an ad-hoc
     /// subscription.
     pub plan_id: u64,
+    /// Last ledger at which a charge is allowed, or 0 for no end. It only
+    /// narrows what the merchant may do.
+    pub expires_at: u32,
 }

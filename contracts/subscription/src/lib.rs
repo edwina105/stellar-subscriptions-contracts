@@ -97,6 +97,63 @@ impl SubscriptionContract {
         total_cap: i128,
         plan_id: u64,
     ) -> Result<u64, Error> {
+        Self::create_subscription(
+            env,
+            subscriber,
+            merchant,
+            token,
+            amount_per_period,
+            interval_ledgers,
+            total_cap,
+            plan_id,
+            0,
+        )
+    }
+
+    /// Same as `subscribe`, with an end ledger. No charge is allowed after
+    /// ledger `expires_at`, so the end only narrows what the merchant may do.
+    /// `expires_at` must be after the current ledger, otherwise
+    /// `InvalidExpiry`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn subscribe_until(
+        env: Env,
+        subscriber: Address,
+        merchant: Address,
+        token: Address,
+        amount_per_period: i128,
+        interval_ledgers: u32,
+        total_cap: i128,
+        plan_id: u64,
+        expires_at: u32,
+    ) -> Result<u64, Error> {
+        if expires_at <= env.ledger().sequence() {
+            return Err(Error::InvalidExpiry);
+        }
+        Self::create_subscription(
+            env,
+            subscriber,
+            merchant,
+            token,
+            amount_per_period,
+            interval_ledgers,
+            total_cap,
+            plan_id,
+            expires_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_subscription(
+        env: Env,
+        subscriber: Address,
+        merchant: Address,
+        token: Address,
+        amount_per_period: i128,
+        interval_ledgers: u32,
+        total_cap: i128,
+        plan_id: u64,
+        expires_at: u32,
+    ) -> Result<u64, Error> {
         storage::read_admin(&env)?;
         subscriber.require_auth();
 
@@ -139,6 +196,7 @@ impl SubscriptionContract {
             next_charge_ledger: now,
             status: SubStatus::Active,
             plan_id,
+            expires_at,
         };
         storage::write_sub(&env, &sub);
         storage::push_index(&env, DataKey::BySubscriber(sub.subscriber.clone()), id);
@@ -202,6 +260,9 @@ impl SubscriptionContract {
 
         // INTERVAL.
         let now = env.ledger().sequence();
+        if sub.expires_at != 0 && now > sub.expires_at {
+            return Err(Error::SubscriptionExpired);
+        }
         if now < sub.next_charge_ledger {
             return Err(Error::IntervalNotElapsed);
         }
@@ -383,6 +444,9 @@ impl SubscriptionContract {
             return Ok(false);
         }
         let now = env.ledger().sequence();
+        if sub.expires_at != 0 && now > sub.expires_at {
+            return Ok(false);
+        }
         if now < sub.next_charge_ledger || now.checked_add(sub.interval_ledgers).is_none() {
             return Ok(false);
         }
