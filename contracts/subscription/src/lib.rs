@@ -109,6 +109,17 @@ impl SubscriptionContract {
         if interval_ledgers == 0 {
             return Err(Error::InvalidInterval);
         }
+        // `charge` computes `now + interval_ledgers` with checked_add. An
+        // interval that does not fit at the current ledger would make every
+        // charge fail with Overflow, so refuse it up front.
+        if env
+            .ledger()
+            .sequence()
+            .checked_add(interval_ledgers)
+            .is_none()
+        {
+            return Err(Error::InvalidInterval);
+        }
         if total_cap < amount_per_period {
             return Err(Error::InvalidCap);
         }

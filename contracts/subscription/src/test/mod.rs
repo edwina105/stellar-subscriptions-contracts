@@ -12,6 +12,7 @@ mod charge;
 mod events;
 mod hostile_token;
 mod integration;
+mod interval_limits;
 mod simulation_drift;
 mod validation;
 mod views;
