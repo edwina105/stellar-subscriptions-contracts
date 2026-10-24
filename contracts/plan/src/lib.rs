@@ -1,4 +1,5 @@
 #![no_std]
+#![warn(missing_docs)]
 //! # Plan Contract
 //!
 //! Merchants publish reusable billing terms — token, amount, interval and a
@@ -19,40 +20,64 @@ use soroban_sdk::{
 };
 use storage::DataKey;
 
+/// Version of this contract, bumped on each incompatible change.
+pub const VERSION: u32 = 1;
+
 /// Longest accepted plan name, in bytes.
 pub const MAX_NAME_LEN: u32 = 64;
 
 /// The one registry call this contract makes.
+// `contractclient` generates an undocumentable companion client type from
+// this trait; the trait's own items are still documented below.
+#[allow(missing_docs)]
 #[contractclient(name = "RegistryClient")]
 pub trait RegistryInterface {
+    /// Count a plan created by this contract.
     fn register_plan(env: Env, plan_id: u64);
 }
 
 /// A merchant published a plan.
+// `contractevent` generates undocumentable topic/publish machinery from this
+// struct; its own fields are still documented below.
+#[allow(missing_docs)]
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlanCreated {
+    /// Id of the plan that was created.
     #[topic]
     pub plan_id: u64,
+    /// Merchant who created the plan.
     #[topic]
     pub merchant: Address,
+    /// The plan's name.
     pub name: String,
+    /// Token the plan bills in.
     pub token: Address,
+    /// Amount charged per interval.
     pub amount_per_period: i128,
+    /// Billing interval, in ledgers.
     pub interval_ledgers: u32,
+    /// Suggested cap for subscribers.
     pub default_cap: i128,
 }
 
 /// A merchant withdrew a plan from new subscriptions.
+// See the `#[allow(missing_docs)]` note on `PlanCreated` above.
+#[allow(missing_docs)]
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlanDeactivated {
+    /// Id of the plan that was deactivated.
     #[topic]
     pub plan_id: u64,
+    /// Merchant who deactivated the plan.
     #[topic]
     pub merchant: Address,
 }
 
+/// The plan contract's entry point.
+// `contract` generates an undocumentable registration shim from this struct.
+#[allow(missing_docs)]
 #[contract]
 pub struct PlanContract;
 
@@ -85,28 +110,23 @@ impl PlanContract {
         Ok(())
     }
 
-    /// Transfer admin role to a new address (can be a contract account or multisig).
-    /// Only the current admin can call this.
-    pub fn transfer_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), Error> {
-        let stored = storage::read_admin(&env)?;
-        admin.require_auth();
-        if stored != admin {
-            return Err(Error::Unauthorized);
-        }
-        // New admin must authorize the transfer (works for contract accounts and multisigs)
-        new_admin.require_auth();
-        storage::write_admin(&env, &new_admin);
-        storage::bump_instance(&env);
-        Ok(())
-    }
-
+    /// The linked registry, if one has been set.
     pub fn get_registry(env: Env) -> Option<Address> {
         storage::read_registry(&env)
     }
 
+    /// Get the admin address.
+    pub fn get_admin(env: Env) -> Result<Address, Error> {
+        storage::read_admin(&env)
+    }
+
+    /// Version of this contract.
+    pub fn version() -> u32 {
+        VERSION
+    }
+
     /// Publish a plan. Requires the merchant's signature. The plan is active
-    /// immediately. `name` must be 1 to `MAX_NAME_LEN` bytes of UTF-8. The
-    /// limit counts bytes, not characters, so multi-byte text uses it faster.
+    /// immediately.
     pub fn create_plan(
         env: Env,
         merchant: Address,
@@ -147,6 +167,7 @@ impl PlanContract {
         storage::write_plan(&env, &plan);
         storage::push_index(&env, DataKey::ByMerchant(plan.merchant.clone()), id);
         storage::push_index(&env, DataKey::AllPlans, id);
+        storage::push_index(&env, DataKey::ByToken(plan.token.clone()), id);
 
         if let Some(registry) = storage::read_registry(&env) {
             let counted = RegistryClient::new(&env, &registry).try_register_plan(&id);
@@ -188,6 +209,7 @@ impl PlanContract {
         Ok(())
     }
 
+    /// Look up a plan by id.
     pub fn get_plan(env: Env, plan_id: u64) -> Result<Plan, Error> {
         storage::read_plan(&env, plan_id)
     }
@@ -209,6 +231,32 @@ impl PlanContract {
             if plan.active {
                 out.push_back(plan);
             }
+        }
+        Ok(out)
+    }
+
+    /// Count of plans billed in a token.
+    pub fn get_plan_count(env: Env, token: Address) -> u32 {
+        storage::read_index(&env, &DataKey::ByToken(token)).len()
+    }
+
+    /// Plans billed in a token, oldest first. Returns up to `limit` plans
+    /// starting at offset `offset`.
+    pub fn get_plans_by_token(
+        env: Env,
+        token: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<Plan>, Error> {
+        if limit == 0 {
+            return Ok(Vec::new(&env));
+        }
+        let mut out = Vec::new(&env);
+        let ids = storage::read_index(&env, &DataKey::ByToken(token));
+        let end = offset.checked_add(limit).ok_or(Error::Overflow)?;
+        let len = ids.len();
+        for i in offset..end.min(len) {
+            out.push_back(storage::read_plan(&env, ids.get(i).unwrap())?);
         }
         Ok(out)
     }

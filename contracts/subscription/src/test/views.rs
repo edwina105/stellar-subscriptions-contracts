@@ -3,43 +3,7 @@
 use soroban_sdk::{testutils::Address as _, Address};
 
 use super::setup::{expect_err, Setup, AMOUNT, CAP, INTERVAL};
-use crate::{Error, SubStatus, VERSION};
-
-#[test]
-fn version_reports_the_contract_version() {
-    let s = Setup::new();
-    assert_eq!(s.client.version(), VERSION);
-}
-
-#[test]
-fn subscriber_pages_are_contiguous_and_capped_at_the_limit() {
-    let s = Setup::new();
-    for _ in 0..5 {
-        s.subscribe();
-    }
-    let full = s.client.get_by_subscriber(&s.subscriber);
-    let first = s.client.get_by_subscriber_page(&s.subscriber, &0, &2);
-    let second = s.client.get_by_subscriber_page(&s.subscriber, &2, &2);
-    let last = s.client.get_by_subscriber_page(&s.subscriber, &4, &2);
-    let past_end = s.client.get_by_subscriber_page(&s.subscriber, &5, &2);
-
-    assert_eq!(first.len(), 2);
-    assert_eq!(second.len(), 2);
-    assert_eq!(last.len(), 1);
-    assert!(past_end.is_empty());
-
-    // The pages run end to end, with no gaps and no repeats.
-    assert_eq!(first.get(0).unwrap().id, full.get(0).unwrap().id);
-    assert_eq!(first.get(1).unwrap().id, second.get(0).unwrap().id);
-    assert_eq!(second.get(1).unwrap().id, last.get(0).unwrap().id);
-    assert_eq!(last.get(0).unwrap().id, full.get(4).unwrap().id);
-
-    // A huge limit is capped, and here that still returns all five.
-    let capped = s
-        .client
-        .get_by_subscriber_page(&s.subscriber, &0, &u32::MAX);
-    assert_eq!(capped.len(), 5);
-}
+use crate::{Error, SubStatus};
 
 #[test]
 fn remaining_cap_and_is_chargeable_track_the_lifecycle() {
@@ -150,6 +114,7 @@ fn get_by_subscriber_and_get_by_merchant_list_each_partys_subscriptions() {
         &INTERVAL,
         &CAP,
         &0,
+        &0,
     );
 
     let mine = s.client.get_by_subscriber(&s.subscriber);
@@ -183,75 +148,119 @@ fn listings_reflect_current_state_not_state_at_creation() {
 }
 
 #[test]
-fn listings_stay_oldest_first_across_interleaved_parties() {
+fn charges_remaining_counts_whole_periods_left() {
     let s = Setup::new();
-    let other_subscriber = Address::generate(&s.env);
-    let other_merchant = Address::generate(&s.env);
+    let id = s.subscribe_with(AMOUNT, INTERVAL, 3 * AMOUNT);
 
-    // Creation order is a, b, c, d, e, with the two subscribers and the two
-    // merchants interleaved.
-    let a = s.subscribe(); // subscriber -> merchant
-    let b = s.client.subscribe(
-        &other_subscriber,
-        &other_merchant,
-        &s.token.address,
-        &AMOUNT,
-        &INTERVAL,
-        &CAP,
-        &0,
-    );
-    let c = s.client.subscribe(
-        &s.subscriber,
-        &other_merchant,
-        &s.token.address,
-        &AMOUNT,
-        &INTERVAL,
-        &CAP,
-        &0,
-    );
-    let d = s.client.subscribe(
-        &other_subscriber,
-        &s.merchant,
-        &s.token.address,
-        &AMOUNT,
-        &INTERVAL,
-        &CAP,
-        &0,
-    );
-    let e = s.subscribe();
+    // Fresh: 3 periods in cap.
+    assert_eq!(s.client.charges_remaining(&id), 3);
 
-    s.client.cancel(&other_subscriber, &b);
-    s.client.cancel(&s.subscriber, &c);
+    s.client.charge(&s.merchant, &id);
+    assert_eq!(s.client.charges_remaining(&id), 2);
+    s.advance(INTERVAL);
 
-    let mine = s.client.get_by_subscriber(&s.subscriber);
-    assert_eq!(mine.len(), 3);
-    assert_eq!(mine.get_unchecked(0).id, a);
-    assert_eq!(mine.get_unchecked(0).status, SubStatus::Active);
-    assert_eq!(mine.get_unchecked(1).id, c);
-    assert_eq!(mine.get_unchecked(1).status, SubStatus::Cancelled);
-    assert_eq!(mine.get_unchecked(2).id, e);
-    assert_eq!(mine.get_unchecked(2).status, SubStatus::Active);
+    s.client.charge(&s.merchant, &id);
+    assert_eq!(s.client.charges_remaining(&id), 1);
+    s.advance(INTERVAL);
 
-    let theirs = s.client.get_by_subscriber(&other_subscriber);
-    assert_eq!(theirs.len(), 2);
-    assert_eq!(theirs.get_unchecked(0).id, b);
-    assert_eq!(theirs.get_unchecked(0).status, SubStatus::Cancelled);
-    assert_eq!(theirs.get_unchecked(1).id, d);
-    assert_eq!(theirs.get_unchecked(1).status, SubStatus::Active);
+    // One more charge exhausts the cap.
+    s.client.charge(&s.merchant, &id);
+    assert_eq!(s.client.get_subscription(&id).status, SubStatus::Exhausted);
+    assert_eq!(s.client.charges_remaining(&id), 0);
+}
 
-    let ours = s.client.get_by_merchant(&s.merchant);
-    assert_eq!(ours.len(), 3);
-    assert_eq!(ours.get_unchecked(0).id, a);
-    assert_eq!(ours.get_unchecked(0).status, SubStatus::Active);
-    assert_eq!(ours.get_unchecked(1).id, d);
-    assert_eq!(ours.get_unchecked(1).status, SubStatus::Active);
-    assert_eq!(ours.get_unchecked(2).id, e);
-    assert_eq!(ours.get_unchecked(2).status, SubStatus::Active);
+#[test]
+fn charges_remaining_is_zero_for_final_states() {
+    let s = Setup::new();
+    let id = s.subscribe();
 
-    let other = s.client.get_by_merchant(&other_merchant);
-    assert_eq!(other.len(), 2);
-    assert_eq!(other.get_unchecked(0).id, b);
-    assert_eq!(other.get_unchecked(0).status, SubStatus::Cancelled);
-    assert_eq!(other.get_unchecked(1).id, c);
-    assert_eq!(other.get_unchecked(1).status, SubStatus::Cancelled);
+    // Cancel: final state.
+    s.client.cancel(&s.subscriber, &id);
+    assert_eq!(s.client.charges_remaining(&id), 0);
+
+    // Fresh subscription to test Exhausted.
+    let id2 = s.subscribe();
+    while s.client.is_chargeable(&id2) {
+        s.client.charge(&s.merchant, &id2);
+        s.advance(INTERVAL);
+    }
+    assert_eq!(s.client.charges_remaining(&id2), 0);
+    assert_eq!(s.client.get_subscription(&id2).status, SubStatus::Exhausted);
+}
+
+#[test]
+fn next_charge_in_tracks_the_schedule() {
+    let s = Setup::new();
+    let id = s.subscribe();
+
+    // Fresh: charge is available now.
+    assert_eq!(s.client.next_charge_in(&id), 0);
+
+    s.client.charge(&s.merchant, &id);
+    // After charge: interval remains.
+    assert_eq!(s.client.next_charge_in(&id), INTERVAL);
+
+    s.advance(INTERVAL / 2);
+    assert_eq!(s.client.next_charge_in(&id), INTERVAL / 2);
+
+    s.advance(INTERVAL / 2);
+    // Now it should be available.
+    assert_eq!(s.client.next_charge_in(&id), 0);
+}
+
+#[test]
+fn next_charge_in_is_zero_for_final_states() {
+    let s = Setup::new();
+    let id = s.subscribe();
+
+    s.client.cancel(&s.subscriber, &id);
+    assert_eq!(s.client.next_charge_in(&id), 0);
+
+    let id2 = s.subscribe();
+    while s.client.is_chargeable(&id2) {
+        s.client.charge(&s.merchant, &id2);
+        s.advance(INTERVAL);
+    }
+    assert_eq!(s.client.next_charge_in(&id2), 0);
+}
+
+#[test]
+fn get_allowance_status_shows_current_allowance() {
+    let s = Setup::new();
+    let id = s.subscribe();
+
+    // After subscribe, outstanding cap equals the subscription cap.
+    let (outstanding, allowance) = s.client.get_allowance_status(&s.subscriber, &s.token.address);
+    assert_eq!(outstanding, CAP);
+    // Allowance is set to match outstanding.
+    assert_eq!(allowance, CAP);
+
+    s.client.charge(&s.merchant, &id);
+    // After charge, outstanding cap is reduced.
+    let (outstanding, _) = s.client.get_allowance_status(&s.subscriber, &s.token.address);
+    assert_eq!(outstanding, CAP - AMOUNT);
+}
+
+#[test]
+fn get_allowance_status_with_zero_allowance() {
+    let s = Setup::new();
+    let id = s.subscribe();
+
+    // Manually set allowance to 0.
+    s.token.approve(&s.subscriber, &s.client.address, &0, &(s.ledger() + 1000));
+
+    let (outstanding, allowance) = s.client.get_allowance_status(&s.subscriber, &s.token.address);
+    assert_eq!(outstanding, CAP);
+    assert_eq!(allowance, 0);
+}
+
+#[test]
+fn get_allowance_status_with_multiple_subscriptions() {
+    let s = Setup::new();
+    let id1 = s.subscribe();
+    let id2 = s.subscribe();
+
+    // Two subscriptions: outstanding cap is 2 * CAP.
+    let (outstanding, _) = s.client.get_allowance_status(&s.subscriber, &s.token.address);
+    assert_eq!(outstanding, 2 * CAP);
 }

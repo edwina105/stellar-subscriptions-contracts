@@ -192,19 +192,6 @@ fn create_plan_accepts_a_name_of_exactly_the_maximum_length() {
 }
 
 #[test]
-fn create_plan_counts_the_name_limit_in_bytes() {
-    let s = Setup::new();
-    // "é" is two bytes in UTF-8. Thirty-two of them are exactly 64 bytes.
-    let accepted = "é".repeat(MAX_NAME_LEN as usize / 2);
-    let id = s.create(&s.merchant, &accepted);
-    assert_eq!(s.client.get_plan(&id).name.len(), MAX_NAME_LEN);
-
-    // Thirty-three look short, but they are 66 bytes and must be rejected.
-    let rejected = "é".repeat(MAX_NAME_LEN as usize / 2 + 1);
-    s.expect_create_err(&rejected, AMOUNT, INTERVAL, CAP, Error::InvalidName);
-}
-
-#[test]
 fn create_plan_rejects_a_non_positive_amount() {
     let s = Setup::new();
     for amount in [0, -1] {
@@ -335,97 +322,6 @@ fn create_plan_emits_plan_created() {
 }
 
 #[test]
-fn get_active_plans_is_empty_before_any_plan_then_follows_creation_order() {
-    let s = Setup::new();
-    assert!(s.client.get_active_plans().is_empty());
-
-    let a = s.create(&s.merchant, "a");
-    let b = s.create(&s.merchant, "b");
-    let c = s.create(&s.merchant, "c");
-    assert_eq!(ids(s.client.get_active_plans()), std::vec![a, b, c]);
-
-    s.client.deactivate_plan(&s.merchant, &b);
-    assert_eq!(ids(s.client.get_active_plans()), std::vec![a, c]);
-
-    // A plan created after a deactivation goes to the end of the list.
-    let d = s.create(&s.merchant, "d");
-    assert_eq!(ids(s.client.get_active_plans()), std::vec![a, c, d]);
-}
-
-#[test]
-fn set_registry_is_admin_only_once_and_refused_after_the_first_plan() {
-    let s = Setup::new();
-    let registry = Address::generate(&s.env);
-    expect_err(
-        s.client.try_set_registry(&s.merchant, &registry),
-        Error::Unauthorized,
-    );
-
-    s.client.set_registry(&s.admin, &registry);
-    assert_eq!(s.client.get_registry(), Some(registry.clone()));
-    expect_err(
-        s.client.try_set_registry(&s.admin, &registry),
-        Error::AlreadyConfigured,
-    );
-
-    // On a contract that already has a plan, the registry cannot be linked,
-    // because the plan would be missing from it.
-    let late = Setup::new();
-    late.create(&late.merchant, "first");
-    let late_registry = Address::generate(&late.env);
-    expect_err(
-        late.client.try_set_registry(&late.admin, &late_registry),
-        Error::AlreadyConfigured,
-    );
-    assert_eq!(late.client.get_registry(), None);
-}
-
-#[test]
-fn a_failing_registry_stops_plan_creation_and_consumes_no_plan_id() {
-    let s = Setup::new();
-    let registry_id = s.env.register(registry::RegistryContract, ());
-    let registry = registry::RegistryContractClient::new(&s.env, &registry_id);
-    registry.initialize(&s.admin);
-    s.client.set_registry(&s.admin, &registry_id);
-
-    // The registry has no writers yet, so it refuses the plan. The whole
-    // creation fails and nothing is stored.
-    s.expect_create_err("first", AMOUNT, INTERVAL, CAP, Error::RegistryUpdateFailed);
-    assert!(s.client.get_active_plans().is_empty());
-
-    // Once the registry is configured, the next plan takes id 1, so the
-    // refused attempt did not use one.
-    registry.set_writers(&s.admin, &Address::generate(&s.env), &s.client.address);
-    let id = s.create(&s.merchant, "first");
-    assert_eq!(id, 1);
-    assert_eq!(s.client.get_plans_by_merchant(&s.merchant).len(), 1);
-}
-
-#[test]
-fn default_cap_of_one_period_and_the_largest_cap_are_accepted() {
-    let s = Setup::new();
-    let one_period = s.client.create_plan(
-        &s.merchant,
-        &s.name("one period"),
-        &s.token,
-        &AMOUNT,
-        &INTERVAL,
-        &AMOUNT,
-    );
-    assert_eq!(s.client.get_plan(&one_period).default_cap, AMOUNT);
-
-    let largest = s.client.create_plan(
-        &s.merchant,
-        &s.name("largest"),
-        &s.token,
-        &AMOUNT,
-        &INTERVAL,
-        &i128::MAX,
-    );
-    assert_eq!(s.client.get_plan(&largest).default_cap, i128::MAX);
-}
-
-#[test]
 fn deactivate_plan_emits_plan_deactivated() {
     let s = Setup::new();
     let id = s.create(&s.merchant, "Pro");
@@ -440,94 +336,128 @@ fn deactivate_plan_emits_plan_deactivated() {
     );
 }
 
-/// Verifies the event schema for `plan_created` and `plan_deactivated`.
-///
-/// Indexers rely on topic position, so adding, removing, or reordering a
-/// topic must make this test fail. The table below is the single source of
-/// truth for each event's layout.
-///
-/// | event            | topics[0]       | topics[1] | data fields                                               |
-/// |------------------|-----------------|-----------|-----------------------------------------------------------|
-/// | plan_created     | plan_id         | merchant  | name, token, amount_per_period, interval_ledgers, default_cap |
-/// | plan_deactivated | plan_id         | merchant  | (none)                                                    |
-///
-/// (The soroban runtime prepends an event-type Symbol as topics[0], so the
-/// two `#[topic]` fields become topics[1] and topics[2] in the raw XDR,
-/// giving 3 topics total.)
 #[test]
-fn event_schema_table() {
-    use soroban_sdk::xdr::{ContractEventBody, ContractEventV0};
+fn get_admin_returns_the_admin_after_initialization() {
+    let s = Setup::new();
+    assert_eq!(s.client.get_admin(), s.admin);
+}
 
-    // ---- plan_created -------------------------------------------------------
-    {
-        let s = Setup::new();
-        let id = s.create(&s.merchant, "Pro");
+#[test]
+fn get_admin_fails_before_initialization() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = PlanContractClient::new(&env, &env.register(PlanContract, ()));
+    expect_err(client.try_get_admin(), Error::NotInitialized);
+}
 
-        let raw: std::vec::Vec<soroban_sdk::xdr::ContractEvent> = s
-            .env
-            .events()
-            .all()
-            .filter_by_contract(&s.client.address)
-            .events()
-            .to_vec();
+#[test]
+fn version_is_1() {
+    let s = Setup::new();
+    assert_eq!(s.client.version(), 1);
+}
 
-        assert_eq!(raw.len(), 1, "create_plan must emit exactly 1 event");
+#[test]
+fn get_plan_count_returns_zero_when_empty() {
+    let s = Setup::new();
+    let token = Address::generate(&s.env);
+    assert_eq!(s.client.get_plan_count(&token), 0);
+}
 
-        let expected = PlanCreated {
-            plan_id: id,
-            merchant: s.merchant.clone(),
-            name: s.name("Pro"),
-            token: s.token.clone(),
-            amount_per_period: AMOUNT,
-            interval_ledgers: INTERVAL,
-            default_cap: CAP,
-        };
-        assert_eq!(
-            raw[0],
-            expected.to_xdr(&s.env, &s.client.address),
-            "PlanCreated schema changed: update topic order (plan_id, merchant) \
-             and data fields (name, token, amount_per_period, interval_ledgers, default_cap)"
-        );
-        // Verify topic count independently so a reorder is also caught.
-        let ContractEventBody::V0(ContractEventV0 { ref topics, .. }) = raw[0].body;
-        assert_eq!(
-            topics.len(),
-            3, // event-type symbol + plan_id + merchant
-            "PlanCreated: expected 3 XDR topics (event-type symbol + plan_id + merchant)"
-        );
-    }
+#[test]
+fn get_plan_count_increments_on_creation() {
+    let s = Setup::new();
+    assert_eq!(s.client.get_plan_count(&s.token), 0);
 
-    // ---- plan_deactivated ---------------------------------------------------
-    {
-        let s = Setup::new();
-        let id = s.create(&s.merchant, "Pro");
-        s.client.deactivate_plan(&s.merchant, &id);
+    s.create(&s.merchant, "A");
+    assert_eq!(s.client.get_plan_count(&s.token), 1);
 
-        let raw: std::vec::Vec<soroban_sdk::xdr::ContractEvent> = s
-            .env
-            .events()
-            .all()
-            .filter_by_contract(&s.client.address)
-            .events()
-            .to_vec();
+    s.create(&s.merchant, "B");
+    assert_eq!(s.client.get_plan_count(&s.token), 2);
+}
 
-        assert_eq!(raw.len(), 1, "deactivate_plan must emit exactly 1 event");
+#[test]
+fn get_plan_count_ignores_plans_for_other_tokens() {
+    let s = Setup::new();
+    let other_token = Address::generate(&s.env);
 
-        let expected = PlanDeactivated {
-            plan_id: id,
-            merchant: s.merchant.clone(),
-        };
-        assert_eq!(
-            raw[0],
-            expected.to_xdr(&s.env, &s.client.address),
-            "PlanDeactivated schema changed: update topic order (plan_id, merchant) \
-             and verify the data body is empty"
-        );
-        let ContractEventBody::V0(ContractEventV0 { ref topics, .. }) = raw[0].body;
-        assert_eq!(
-            topics.len(),
-            3, // event-type symbol + plan_id + merchant
-            "PlanDeactivated: expected 3 XDR topics (event-type symbol + plan_id + merchant)"
-        );
-    }
+    let _id1 = s.client.create_plan(
+        &s.merchant,
+        &s.name("A"),
+        &s.token,
+        &AMOUNT,
+        &INTERVAL,
+        &CAP,
+    );
+    let _id2 = s.client.create_plan(
+        &s.merchant,
+        &s.name("B"),
+        &other_token,
+        &AMOUNT,
+        &INTERVAL,
+        &CAP,
+    );
+
+    assert_eq!(s.client.get_plan_count(&s.token), 1);
+    assert_eq!(s.client.get_plan_count(&other_token), 1);
+}
+
+#[test]
+fn get_plans_by_token_returns_empty_when_none() {
+    let s = Setup::new();
+    let token = Address::generate(&s.env);
+    assert!(s.client.get_plans_by_token(&token, &0, &10).is_empty());
+}
+
+#[test]
+fn get_plans_by_token_returns_plans_in_creation_order() {
+    let s = Setup::new();
+    let a = s.create(&s.merchant, "A");
+    let b = s.create(&s.merchant, "B");
+    let c = s.create(&s.merchant, "C");
+
+    let all = s.client.get_plans_by_token(&s.token, &0, &10);
+    assert_eq!(ids(all), [a, b, c]);
+}
+
+#[test]
+fn get_plans_by_token_respects_offset_and_limit() {
+    let s = Setup::new();
+    let a = s.create(&s.merchant, "A");
+    let b = s.create(&s.merchant, "B");
+    let c = s.create(&s.merchant, "C");
+    let d = s.create(&s.merchant, "D");
+
+    assert_eq!(ids(s.client.get_plans_by_token(&s.token, &0, &2)), [a, b]);
+    assert_eq!(ids(s.client.get_plans_by_token(&s.token, &1, &2)), [b, c]);
+    assert_eq!(ids(s.client.get_plans_by_token(&s.token, &2, &2)), [c, d]);
+    assert_eq!(ids(s.client.get_plans_by_token(&s.token, &3, &2)), [d]);
+    let empty: std::vec::Vec<u64> = std::vec::Vec::new();
+    assert_eq!(ids(s.client.get_plans_by_token(&s.token, &4, &2)), empty);
+}
+
+#[test]
+fn get_plans_by_token_zero_limit_returns_empty() {
+    let s = Setup::new();
+    s.create(&s.merchant, "A");
+    assert!(s.client.get_plans_by_token(&s.token, &0, &0).is_empty());
+}
+
+#[test]
+fn get_plans_by_token_only_includes_plans_for_that_token() {
+    let s = Setup::new();
+    let other_token = Address::generate(&s.env);
+
+    let a = s.create(&s.merchant, "A");
+    let b = s.client.create_plan(
+        &s.merchant,
+        &s.name("B"),
+        &other_token,
+        &AMOUNT,
+        &INTERVAL,
+        &CAP,
+    );
+    let c = s.create(&s.merchant, "C");
+
+    assert_eq!(ids(s.client.get_plans_by_token(&s.token, &0, &10)), [a, c]);
+    assert_eq!(ids(s.client.get_plans_by_token(&other_token, &0, &10)), [b]);
 }

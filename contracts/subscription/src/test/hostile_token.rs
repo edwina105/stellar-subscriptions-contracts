@@ -159,6 +159,7 @@ impl World {
             &INTERVAL,
             &CAP,
             &0,
+            &0,
         )
     }
 }
@@ -224,6 +225,7 @@ fn a_token_that_panics_makes_subscribe_fail_cleanly_and_leaves_no_record() {
             &AMOUNT,
             &INTERVAL,
             &CAP,
+            &0,
             &0,
         ),
         Error::ApprovalFailed,
