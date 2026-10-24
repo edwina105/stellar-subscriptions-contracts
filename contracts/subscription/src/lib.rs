@@ -15,9 +15,32 @@ mod types;
 pub use errors::Error;
 pub use types::{SubStatus, Subscription};
 
-use events::{Cancelled, Charged, MerchantEnded, Paused, Resumed, Subscribed};
+/// Why a charge would succeed or be refused right now. `charge_status`
+/// returns one of these, so a UI can explain a refusal without trying a
+/// charge. Every variant except `Chargeable` is a refusal.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChargeStatus {
+    /// `charge` would succeed.
+    Chargeable = 0,
+    /// The subscriber paused it. Resume to charge again.
+    Paused = 1,
+    /// The subscriber cancelled it. Final.
+    Cancelled = 2,
+    /// The cap has been reached. Final.
+    Exhausted = 3,
+    /// The interval has not elapsed yet.
+    TooEarly = 4,
+    /// One more period would go over `total_cap`.
+    CapWouldBeExceeded = 5,
+    /// `now + interval_ledgers` overflows, so `charge` would fail with
+    /// Overflow.
+    IntervalOverflows = 6,
+}
+
+use events::{Cancelled, Charged, Paused, Resumed, Subscribed};
 use interfaces::{PlanClient, RegistryClient};
-use soroban_sdk::{contract, contractimpl, token::TokenClient, Address, Env, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, token::TokenClient, Address, Env, Vec};
 use storage::DataKey;
 
 #[contract]
@@ -84,9 +107,8 @@ impl SubscriptionContract {
     ///
     /// A non-zero `plan_id` must name an active plan whose merchant, token,
     /// amount and interval match exactly; 0 creates an ad-hoc subscription.
-    /// The first charge is available after `trial_ledgers` (immediately if 0).
-    /// Also approves this contract to spend the subscriber's outstanding cap in
-    /// `token`.
+    /// The first charge is available immediately. Also approves this contract
+    /// to spend the subscriber's outstanding cap in `token`.
     #[allow(clippy::too_many_arguments)]
     pub fn subscribe(
         env: Env,
@@ -97,7 +119,6 @@ impl SubscriptionContract {
         interval_ledgers: u32,
         total_cap: i128,
         plan_id: u64,
-        trial_ledgers: u32,
     ) -> Result<u64, Error> {
         storage::read_admin(&env)?;
         subscriber.require_auth();
@@ -109,6 +130,17 @@ impl SubscriptionContract {
             return Err(Error::InvalidAmount);
         }
         if interval_ledgers == 0 {
+            return Err(Error::InvalidInterval);
+        }
+        // `charge` computes `now + interval_ledgers` with checked_add. An
+        // interval that does not fit at the current ledger would make every
+        // charge fail with Overflow, so refuse it up front.
+        if env
+            .ledger()
+            .sequence()
+            .checked_add(interval_ledgers)
+            .is_none()
+        {
             return Err(Error::InvalidInterval);
         }
         if total_cap < amount_per_period {
@@ -127,9 +159,6 @@ impl SubscriptionContract {
 
         let id = storage::take_next_id(&env)?;
         let now = env.ledger().sequence();
-        let next_charge_ledger = now
-            .checked_add(trial_ledgers)
-            .ok_or(Error::Overflow)?;
         let sub = Subscription {
             id,
             subscriber,
@@ -141,10 +170,9 @@ impl SubscriptionContract {
             total_charged: 0,
             start_ledger: now,
             last_charge_ledger: 0,
-            next_charge_ledger,
+            next_charge_ledger: now,
             status: SubStatus::Active,
             plan_id,
-            trial_ledgers,
         };
         storage::write_sub(&env, &sub);
         storage::push_index(&env, DataKey::BySubscriber(sub.subscriber.clone()), id);
@@ -204,7 +232,6 @@ impl SubscriptionContract {
             SubStatus::Paused => return Err(Error::SubscriptionPaused),
             SubStatus::Cancelled => return Err(Error::SubscriptionCancelled),
             SubStatus::Exhausted => return Err(Error::SubscriptionExhausted),
-            SubStatus::MerchantEnded => return Err(Error::SubscriptionMerchantEnded),
         }
 
         // INTERVAL.
@@ -275,7 +302,6 @@ impl SubscriptionContract {
             SubStatus::Active | SubStatus::Paused => {}
             SubStatus::Cancelled => return Err(Error::SubscriptionCancelled),
             SubStatus::Exhausted => return Err(Error::SubscriptionExhausted),
-            SubStatus::MerchantEnded => return Err(Error::SubscriptionMerchantEnded),
         }
 
         sub.status = SubStatus::Cancelled;
@@ -310,7 +336,6 @@ impl SubscriptionContract {
             SubStatus::Paused => return Err(Error::AlreadyPaused),
             SubStatus::Cancelled => return Err(Error::SubscriptionCancelled),
             SubStatus::Exhausted => return Err(Error::SubscriptionExhausted),
-            SubStatus::MerchantEnded => return Err(Error::SubscriptionMerchantEnded),
         }
 
         sub.status = SubStatus::Paused;
@@ -338,7 +363,6 @@ impl SubscriptionContract {
             SubStatus::Active => return Err(Error::NotPaused),
             SubStatus::Cancelled => return Err(Error::SubscriptionCancelled),
             SubStatus::Exhausted => return Err(Error::SubscriptionExhausted),
-            SubStatus::MerchantEnded => return Err(Error::SubscriptionMerchantEnded),
         }
 
         let now = env.ledger().sequence();
@@ -351,37 +375,6 @@ impl SubscriptionContract {
             subscription_id,
             subscriber,
             next_charge_ledger: sub.next_charge_ledger,
-        }
-        .publish(&env);
-        Ok(())
-    }
-
-    /// Merchant ends a subscription, stopping future charges. The subscription
-    /// status becomes `MerchantEnded`, which is final. The subscriber can still
-    /// cancel to release their token allowance. The registry is notified of the
-    /// change.
-    pub fn merchant_end(env: Env, merchant: Address, subscription_id: u64) -> Result<(), Error> {
-        merchant.require_auth();
-        let mut sub = storage::read_sub(&env, subscription_id)?;
-        if sub.merchant != merchant {
-            return Err(Error::NotMerchant);
-        }
-
-        match sub.status {
-            SubStatus::Active | SubStatus::Paused => {}
-            SubStatus::Cancelled => return Err(Error::SubscriptionCancelled),
-            SubStatus::Exhausted => return Err(Error::SubscriptionExhausted),
-            SubStatus::MerchantEnded => return Err(Error::SubscriptionMerchantEnded),
-        }
-
-        sub.status = SubStatus::MerchantEnded;
-        storage::write_sub(&env, &sub);
-        Self::report(&env, &sub)?;
-        storage::bump_instance(&env);
-        MerchantEnded {
-            subscription_id,
-            merchant: sub.merchant,
-            total_charged: sub.total_charged,
         }
         .publish(&env);
         Ok(())
@@ -433,6 +426,31 @@ impl SubscriptionContract {
         })
     }
 
+    /// Why `charge` would succeed or be refused right now. It runs the same
+    /// checks as `is_chargeable`, in the same order, so the two always agree:
+    /// `Chargeable` exactly when `is_chargeable` is true. The token is not
+    /// consulted, as with `is_chargeable`.
+    pub fn charge_status(env: Env, subscription_id: u64) -> Result<ChargeStatus, Error> {
+        let sub = storage::read_sub(&env, subscription_id)?;
+        match sub.status {
+            SubStatus::Active => {}
+            SubStatus::Paused => return Ok(ChargeStatus::Paused),
+            SubStatus::Cancelled => return Ok(ChargeStatus::Cancelled),
+            SubStatus::Exhausted => return Ok(ChargeStatus::Exhausted),
+        }
+        let now = env.ledger().sequence();
+        if now < sub.next_charge_ledger {
+            return Ok(ChargeStatus::TooEarly);
+        }
+        if now.checked_add(sub.interval_ledgers).is_none() {
+            return Ok(ChargeStatus::IntervalOverflows);
+        }
+        Ok(match sub.total_charged.checked_add(sub.amount_per_period) {
+            Some(total) if total <= sub.total_cap => ChargeStatus::Chargeable,
+            _ => ChargeStatus::CapWouldBeExceeded,
+        })
+    }
+
     /// Cap that can still ever be charged: `total_cap - total_charged` while
     /// Active or Paused, and 0 once Cancelled or Exhausted.
     pub fn remaining_cap(env: Env, subscription_id: u64) -> Result<i128, Error> {
@@ -443,63 +461,6 @@ impl SubscriptionContract {
         sub.total_cap
             .checked_sub(sub.total_charged)
             .ok_or(Error::Overflow)
-    }
-
-    /// Number of whole periods the subscription's cap still allows to be
-    /// charged. Returns 0 for final states (Cancelled, Exhausted, or
-    /// MerchantEnded).
-    pub fn charges_remaining(env: Env, subscription_id: u64) -> Result<i128, Error> {
-        let sub = storage::read_sub(&env, subscription_id)?;
-        if sub.status.is_final() {
-            return Ok(0);
-        }
-        let remaining_cap = sub
-            .total_cap
-            .checked_sub(sub.total_charged)
-            .ok_or(Error::Overflow)?;
-        Ok(remaining_cap / sub.amount_per_period)
-    }
-
-    /// Ledgers until the next charge may succeed. Returns 0 if a charge is
-    /// allowed right now. Returns 0 for final states even if the schedule
-    /// suggests otherwise.
-    pub fn next_charge_in(env: Env, subscription_id: u64) -> Result<u32, Error> {
-        let sub = storage::read_sub(&env, subscription_id)?;
-        if sub.status.is_final() {
-            return Ok(0);
-        }
-        let now = env.ledger().sequence();
-        if now >= sub.next_charge_ledger {
-            return Ok(0);
-        }
-        Ok(sub
-            .next_charge_ledger
-            .checked_sub(now)
-            .ok_or(Error::Overflow)?)
-    }
-
-    /// Token allowance status for a subscriber. Returns the outstanding cap
-    /// (sum of remaining caps across non-final subscriptions) and the current
-    /// allowance granted to this contract.
-    ///
-    /// Note: The expiry ledger of the allowance cannot be reliably determined
-    /// from the Soroban token interface. Callers should track allowance expiry
-    /// through events or refresh the allowance periodically via
-    /// `refresh_allowance`.
-    pub fn get_allowance_status(
-        env: Env,
-        subscriber: Address,
-        token: Address,
-    ) -> Result<(i128, i128), Error> {
-        let outstanding = allowance::outstanding(&env, &subscriber, &token)?;
-        let spender = env.current_contract_address();
-        let current_allowance = match soroban_sdk::token::TokenClient::new(&env, &token)
-            .try_allowance(&subscriber, &spender)
-        {
-            Ok(Ok(amount)) => amount,
-            _ => 0,
-        };
-        Ok((outstanding, current_allowance))
     }
 
     /// Every subscription a subscriber has created, oldest first.
