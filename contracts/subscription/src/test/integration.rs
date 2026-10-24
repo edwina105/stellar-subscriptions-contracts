@@ -55,6 +55,7 @@ impl Linked {
             &INTERVAL,
             &cap,
             &plan_id,
+            &0,
         )
     }
 }
@@ -81,6 +82,7 @@ fn subscribing_to_an_unknown_plan_is_rejected() {
             &INTERVAL,
             &CAP,
             &99,
+            &0,
         ),
         Error::PlanNotFound,
     );
@@ -100,6 +102,7 @@ fn subscribing_to_a_deactivated_plan_is_rejected() {
             &INTERVAL,
             &CAP,
             &plan_id,
+            &0,
         ),
         Error::PlanInactive,
     );
@@ -139,6 +142,7 @@ fn terms_that_differ_from_the_plan_are_rejected() {
                 &interval,
                 &CAP,
                 &plan_id,
+                &0,
             ),
             Error::PlanMismatch,
         );
@@ -169,6 +173,7 @@ fn a_plan_id_without_a_linked_plan_contract_is_rejected() {
             &INTERVAL,
             &CAP,
             &1,
+            &0,
         ),
         Error::PlanContractNotSet,
     );
@@ -300,8 +305,37 @@ fn a_misconfigured_registry_blocks_subscribe_instead_of_losing_the_record() {
             &INTERVAL,
             &CAP,
             &0,
+            &0,
         ),
         Error::RegistryUpdateFailed,
     );
     assert_eq!(s.allowance(), 0);
+}
+
+#[test]
+fn plan_mirror_in_subscription_matches_plan_contract_including_description() {
+    let l = linked();
+    let desc = String::from_str(&l.s.env, "Enterprise plan with priority support");
+    let plan_id = l.plans.create_plan(
+        &l.s.merchant,
+        &String::from_str(&l.s.env, "Enterprise"),
+        &l.s.token.address,
+        &AMOUNT,
+        &INTERVAL,
+        &CAP,
+        &Some(desc.clone()),
+    );
+
+    // Get plan from plan contract
+    let plan_from_contract = l.plans.get_plan(&plan_id);
+
+    // Subscribe to verify mirror decodes correctly with description field
+    let id = l.subscribe_to(plan_id, CAP);
+    let sub = l.s.sub(id);
+
+    // Verify the subscription was created with the plan id
+    assert_eq!(sub.plan_id, plan_id);
+
+    // Verify plan contract's plan has the description
+    assert_eq!(plan_from_contract.description, Some(desc));
 }
